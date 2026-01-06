@@ -396,6 +396,7 @@ TOOLS_MAIN_SOURCES =                                                    \
   db_stress_tool/db_stress.cc                                           \
   tools/blob_dump.cc                                                    \
   tools/block_cache_analyzer/block_cache_trace_analyzer_tool.cc         \
+  tools/db_compact.cc                                                   \
   tools/db_repl_stress.cc                                               \
   tools/db_sanity_test.cc                                               \
   tools/ldb.cc                                                          \

@@ -1538,6 +1538,11 @@ if(WITH_BENCHMARK_TOOLS)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
 
+  add_executable(db_compact${ARTIFACT_SUFFIX}
+    tools/db_compact.cc)
+  target_link_libraries(db_compact${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+
   add_executable(cache_bench${ARTIFACT_SUFFIX}
     cache/cache_bench.cc
     cache/cache_bench_tool.cc)
