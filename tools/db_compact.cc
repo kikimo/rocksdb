@@ -41,6 +41,12 @@ DEFINE_string(column_families, "",
               "If empty, compacts all column families. "
               "Example: --column_families=cf1,cf2,cf3");
 
+// Exclusive mode (optional)
+DEFINE_bool(exclusive, false,
+            "If true, compact all column families EXCEPT those listed in "
+            "--column_families. This flag inverts the selection logic. "
+            "Requires --column_families to be non-empty.");
+
 // Compression type
 DEFINE_string(compression_type, "lz4",
               "Compression algorithm to use: none, snappy, zlib, bz2, lz4, "
@@ -130,6 +136,15 @@ class DBCompactor {
       return false;
     }
 
+    if (FLAGS_exclusive && FLAGS_column_families.empty()) {
+      fprintf(stderr,
+              "Error: --exclusive requires --column_families to be non-empty\n");
+      fprintf(stderr,
+              "       Use --exclusive with --column_families to compact all CFs "
+              "EXCEPT the listed ones\n");
+      return false;
+    }
+
     if (FLAGS_max_background_jobs <= 0) {
       fprintf(stderr, "Error: --max_background_jobs must be positive\n");
       return false;
@@ -186,7 +201,9 @@ class DBCompactor {
     }
 
     // Parse user-specified column families
+    std::vector<std::string> specified_cf_names;
     std::vector<std::string> target_cf_names;
+
     if (!FLAGS_column_families.empty()) {
       std::stringstream ss(FLAGS_column_families);
       std::string cf_name;
@@ -196,12 +213,12 @@ class DBCompactor {
         cf_name.erase(cf_name.find_last_not_of(" \t\n\r\f\v") + 1);
 
         if (!cf_name.empty()) {
-          target_cf_names.push_back(cf_name);
+          specified_cf_names.push_back(cf_name);
         }
       }
 
       // Validate specified CF names exist
-      for (const auto& name : target_cf_names) {
+      for (const auto& name : specified_cf_names) {
         if (std::find(cf_names_.begin(), cf_names_.end(), name) ==
             cf_names_.end()) {
           fprintf(stderr, "Error: Column family '%s' does not exist\n",
@@ -210,9 +227,30 @@ class DBCompactor {
         }
       }
 
-      printf("\nWill compact %zu column families:\n", target_cf_names.size());
-      for (const auto& name : target_cf_names) {
-        printf("  - %s\n", name.c_str());
+      // Determine target CFs based on exclusive flag
+      if (FLAGS_exclusive) {
+        // Exclusive mode: compact all CFs EXCEPT the specified ones
+        for (const auto& name : cf_names_) {
+          if (std::find(specified_cf_names.begin(), specified_cf_names.end(),
+                        name) == specified_cf_names.end()) {
+            target_cf_names.push_back(name);
+          }
+        }
+        printf("\nExclusive mode: Will compact all CFs EXCEPT:\n");
+        for (const auto& name : specified_cf_names) {
+          printf("  - %s (excluded)\n", name.c_str());
+        }
+        printf("\nActual CFs to compact (%zu):\n", target_cf_names.size());
+        for (const auto& name : target_cf_names) {
+          printf("  - %s\n", name.c_str());
+        }
+      } else {
+        // Normal mode: compact only the specified CFs
+        target_cf_names = specified_cf_names;
+        printf("\nWill compact %zu column families:\n", target_cf_names.size());
+        for (const auto& name : target_cf_names) {
+          printf("  - %s\n", name.c_str());
+        }
       }
     } else {
       target_cf_names = cf_names_;
@@ -315,8 +353,10 @@ class DBCompactor {
     printf("  max_subcompactions: %d\n", FLAGS_max_subcompactions);
     printf("  compression_type: %s\n", FLAGS_compression_type.c_str());
     printf("  block_size: %dKB\n", FLAGS_block_size);
-    printf("  exclusive: %s\n",
+    printf("  exclusive_manual_compaction: %s\n",
            FLAGS_exclusive_manual_compaction ? "true" : "false");
+    printf("  exclusive (invert CF selection): %s\n",
+           FLAGS_exclusive ? "true" : "false");
     printf("\n");
 
     // Parse bottommost level compaction
@@ -341,8 +381,10 @@ class DBCompactor {
     compact_options.target_level = FLAGS_target_level;
     compact_options.bottommost_level_compaction = bottommost;
 
-    // Parse target column families
+    // Parse specified column families and compute target CFs
+    std::vector<std::string> specified_cf_names;
     std::vector<std::string> target_cf_names;
+
     if (!FLAGS_column_families.empty()) {
       std::stringstream ss(FLAGS_column_families);
       std::string cf_name;
@@ -350,8 +392,22 @@ class DBCompactor {
         cf_name.erase(0, cf_name.find_first_not_of(" \t\n\r\f\v"));
         cf_name.erase(cf_name.find_last_not_of(" \t\n\r\f\v") + 1);
         if (!cf_name.empty()) {
-          target_cf_names.push_back(cf_name);
+          specified_cf_names.push_back(cf_name);
         }
+      }
+
+      // Determine target CFs based on exclusive flag
+      if (FLAGS_exclusive) {
+        // Exclusive mode: compact all CFs EXCEPT the specified ones
+        for (const auto& name : cf_names_) {
+          if (std::find(specified_cf_names.begin(), specified_cf_names.end(),
+                        name) == specified_cf_names.end()) {
+            target_cf_names.push_back(name);
+          }
+        }
+      } else {
+        // Normal mode: compact only the specified CFs
+        target_cf_names = specified_cf_names;
       }
     } else {
       target_cf_names = cf_names_;
@@ -361,10 +417,12 @@ class DBCompactor {
     for (size_t i = 0; i < cf_handles_.size(); ++i) {
       const std::string& cf_name = cf_names_[i];
 
-      // Skip if not in target list
-      if (!target_cf_names.empty() &&
-          std::find(target_cf_names.begin(), target_cf_names.end(), cf_name) ==
-              target_cf_names.end()) {
+      // Check if this CF should be compacted
+      bool should_compact =
+          std::find(target_cf_names.begin(), target_cf_names.end(), cf_name) !=
+          target_cf_names.end();
+
+      if (!should_compact) {
         if (FLAGS_verbose) {
           printf("Skipping column family: %s\n", cf_name.c_str());
         }
@@ -453,6 +511,9 @@ int main(int argc, char** argv) {
       "  # Compact specific column families\n"
       "  db_compact --db=/data/mydb --column_families=cf1,cf2,cf3\n"
       "\n"
+      "  # Compact all CFs EXCEPT cf1 and cf2 (exclusive mode)\n"
+      "  db_compact --db=/data/mydb --column_families=cf1,cf2 --exclusive=true\n"
+      "\n"
       "  # Use ZSTD compression with high parallelism\n"
       "  db_compact --db=/data/mydb --compression_type=zstd \\\n"
       "             --max_background_jobs=32 --max_subcompactions=8\n"
@@ -460,8 +521,12 @@ int main(int argc, char** argv) {
       "  # Use custom block size (16KB)\n"
       "  db_compact --db=/data/mydb --block_size=16\n"
       "\n"
-      "  # Exclusive compaction (no other compactions run)\n"
-      "  db_compact --db=/data/mydb --exclusive_manual_compaction=true\n");
+      "  # Exclusive manual compaction (no other compactions run)\n"
+      "  db_compact --db=/data/mydb --exclusive_manual_compaction=true\n"
+      "\n"
+      "  # Compact all CFs except 'default' and 'metadata' with ZSTD\n"
+      "  db_compact --db=/data/mydb --column_families=default,metadata \\\n"
+      "             --exclusive=true --compression_type=zstd\n");
 
   ParseCommandLineFlags(&argc, &argv, true);
 
