@@ -5,6 +5,7 @@
 //
 // db_compact: A tool to compact RocksDB databases with flexible options
 
+#include "rocksdb/status.h"
 #ifndef GFLAGS
 #include <cstdio>
 int main() {
@@ -13,6 +14,7 @@ int main() {
 }
 #else
 
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -22,6 +24,7 @@ int main() {
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/table.h"
 #include "rocksdb/utilities/options_util.h"
 #include "util/gflags_compat.h"
 #include "util/string_util.h"
@@ -67,12 +70,10 @@ DEFINE_string(
     "Bottommost level compaction strategy: kSkip, kIfHaveCompactionFilter, "
     "kForce, kForceOptimized");
 
-// I/O and performance options
-DEFINE_int32(max_open_files, -1,
-             "Maximum number of open files (-1 means unlimited)");
-
 DEFINE_uint64(compaction_readahead_size, 2097152,  // 2MB default
               "Compaction readahead size in bytes (0 to disable)");
+
+DEFINE_int32(block_size, 8, "Block size in KB for SST files (default: 8KB)");
 
 // Display options
 DEFINE_bool(verbose, false, "Enable verbose output");
@@ -139,19 +140,44 @@ class DBCompactor {
       return false;
     }
 
+    if (FLAGS_block_size <= 0) {
+      fprintf(stderr, "Error: --block_size must be positive\n");
+      return false;
+    }
+
+    if (FLAGS_block_size > 1024) {
+      fprintf(stderr,
+              "Warning: --block_size=%dKB is very large (max recommended: "
+              "1024KB)\n",
+              FLAGS_block_size);
+    }
+
     return true;
   }
 
   Status OpenDatabase() {
     printf("Opening database: %s\n", FLAGS_db.c_str());
 
-    // List all column families in the database
-    DBOptions db_options;
-    Status s = DB::ListColumnFamilies(db_options, FLAGS_db, &cf_names_);
+    // Load existing database options
+    DBOptions loaded_db_options;
+    std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
+    ConfigOptions config_options;
+
+    Status s = LoadLatestOptions(config_options, FLAGS_db, &loaded_db_options,
+                                 &loaded_cf_descs);
     if (!s.ok()) {
-      fprintf(stderr, "Failed to list column families: %s\n",
+      fprintf(stderr, "Failed to load existing database options: %s\n",
               s.ToString().c_str());
+      fprintf(stderr, "Cannot proceed without existing options.\n");
       return s;
+    }
+
+    printf("Successfully loaded existing database options\n");
+
+    // Extract column family names from loaded descriptors
+    cf_names_.clear();
+    for (const auto& cf_desc : loaded_cf_descs) {
+      cf_names_.push_back(cf_desc.name);
     }
 
     printf("Found %zu column families:\n", cf_names_.size());
@@ -193,37 +219,13 @@ class DBCompactor {
       printf("\nWill compact all column families\n");
     }
 
-    // Prepare column family descriptors
-    std::vector<ColumnFamilyDescriptor> cf_descriptors;
-    Options options = BuildOptions();
-
-    for (const auto& name : cf_names_) {
-      cf_descriptors.emplace_back(name, options);
-    }
-
-    // Open database with all column families
-    s = DB::Open(options, FLAGS_db, cf_descriptors, &cf_handles_, &db_);
-    if (!s.ok()) {
-      return s;
-    }
-
-    printf("\n✓ Database opened successfully\n");
-    return Status::OK();
-  }
-
-  Options BuildOptions() {
-    Options options;
-
-    // DB options
-    DBOptions db_options;
-    db_options.max_background_jobs = FLAGS_max_background_jobs;
-    db_options.max_open_files = FLAGS_max_open_files;
-    db_options.compaction_readahead_size = FLAGS_compaction_readahead_size;
-    db_options.max_subcompactions =
+    // Override performance-related DB options
+    loaded_db_options.max_background_jobs = FLAGS_max_background_jobs;
+    loaded_db_options.compaction_readahead_size =
+        FLAGS_compaction_readahead_size;
+    loaded_db_options.max_subcompactions =
         static_cast<uint32_t>(FLAGS_max_subcompactions);
 
-    // CF options
-    ColumnFamilyOptions cf_options;
     // Parse compression type
     CompressionType compression = kLZ4Compression;
     std::string comp_lower = FLAGS_compression_type;
@@ -251,10 +253,59 @@ class DBCompactor {
               FLAGS_compression_type.c_str());
     }
 
-    cf_options.compression = compression;
+    // Override compression ONLY for user-specified column families
+    for (auto& cf_desc : loaded_cf_descs) {
+      // Check if this CF is in the target list (or if we're compacting all CFs)
+      if (target_cf_names.empty() ||
+          std::find(target_cf_names.begin(), target_cf_names.end(),
+                    cf_desc.name) != target_cf_names.end()) {
+        printf("Setting compression to %s for CF: %s\n",
+               FLAGS_compression_type.c_str(), cf_desc.name.c_str());
+        cf_desc.options.compression = compression;
 
-    options = Options(db_options, cf_options);
-    return options;
+        // Set block_size for BlockBasedTable
+        BlockBasedTableOptions table_options;
+
+        // Try to get existing table options if available
+        if (cf_desc.options.table_factory == nullptr) {
+          fprintf(stderr, "Failed loading table option for column family'%s\n",
+                  cf_desc.name.c_str());
+          return Status::InvalidArgument("No table option found");
+        }
+        auto* existing_options =
+            cf_desc.options.table_factory->GetOptions<BlockBasedTableOptions>();
+        if (existing_options == nullptr) {
+          fprintf(stderr, "Failed loading table option for column family'%s\n",
+                  cf_desc.name.c_str());
+          return Status::InvalidArgument("No table option found");
+        }
+        table_options = *existing_options;  // Copy existing options
+
+        // Override block_size
+        table_options.block_size =
+            FLAGS_block_size * 1024;  // Convert KB to bytes
+
+        // Create new table factory with updated options
+        cf_desc.options.table_factory.reset(
+            NewBlockBasedTableFactory(table_options));
+
+        printf("Setting block_size to %dKB for CF: %s\n", FLAGS_block_size,
+               cf_desc.name.c_str());
+      } else {
+        printf("Keeping original compression for CF: %s\n",
+               cf_desc.name.c_str());
+      }
+    }
+
+    // Open database with modified options
+    s = DB::Open(loaded_db_options, FLAGS_db, loaded_cf_descs, &cf_handles_,
+                 &db_);
+    if (!s.ok()) {
+      return s;
+    }
+
+    printf("\n✓ Database opened successfully\n");
+    return Status::OK();
   }
 
   Status PerformCompaction() {
@@ -263,6 +314,7 @@ class DBCompactor {
     printf("  max_background_jobs: %d\n", FLAGS_max_background_jobs);
     printf("  max_subcompactions: %d\n", FLAGS_max_subcompactions);
     printf("  compression_type: %s\n", FLAGS_compression_type.c_str());
+    printf("  block_size: %dKB\n", FLAGS_block_size);
     printf("  exclusive: %s\n",
            FLAGS_exclusive_manual_compaction ? "true" : "false");
     printf("\n");
@@ -404,6 +456,9 @@ int main(int argc, char** argv) {
       "  # Use ZSTD compression with high parallelism\n"
       "  db_compact --db=/data/mydb --compression_type=zstd \\\n"
       "             --max_background_jobs=32 --max_subcompactions=8\n"
+      "\n"
+      "  # Use custom block size (16KB)\n"
+      "  db_compact --db=/data/mydb --block_size=16\n"
       "\n"
       "  # Exclusive compaction (no other compactions run)\n"
       "  db_compact --db=/data/mydb --exclusive_manual_compaction=true\n");
