@@ -35,6 +35,12 @@ using GFLAGS_NAMESPACE::SetUsageMessage;
 // Database path (required)
 DEFINE_string(db, "", "Path to the RocksDB database (required)");
 
+// Options file path (optional)
+DEFINE_string(option_file, "",
+              "Path to a RocksDB OPTIONS file to use for opening the database. "
+              "If empty, uses the latest OPTIONS file from the database directory. "
+              "Example: --option_file=/path/to/OPTIONS-123456");
+
 // Column families to compact (optional)
 DEFINE_string(column_families, "",
               "Comma-separated list of column families to compact. "
@@ -173,21 +179,36 @@ class DBCompactor {
   Status OpenDatabase() {
     printf("Opening database: %s\n", FLAGS_db.c_str());
 
-    // Load existing database options
+    // Load database options
     DBOptions loaded_db_options;
     std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
     ConfigOptions config_options;
+    Status s;
 
-    Status s = LoadLatestOptions(config_options, FLAGS_db, &loaded_db_options,
-                                 &loaded_cf_descs);
-    if (!s.ok()) {
-      fprintf(stderr, "Failed to load existing database options: %s\n",
-              s.ToString().c_str());
-      fprintf(stderr, "Cannot proceed without existing options.\n");
-      return s;
+    if (!FLAGS_option_file.empty()) {
+      // Load options from specified OPTIONS file
+      printf("Loading options from file: %s\n", FLAGS_option_file.c_str());
+      s = LoadOptionsFromFile(config_options, FLAGS_option_file,
+                              &loaded_db_options, &loaded_cf_descs);
+      if (!s.ok()) {
+        fprintf(stderr, "Failed to load options from file '%s': %s\n",
+                FLAGS_option_file.c_str(), s.ToString().c_str());
+        return s;
+      }
+      printf("Successfully loaded options from specified file\n");
+    } else {
+      // Load latest OPTIONS file from database directory
+      printf("Loading latest options from database directory\n");
+      s = LoadLatestOptions(config_options, FLAGS_db, &loaded_db_options,
+                            &loaded_cf_descs);
+      if (!s.ok()) {
+        fprintf(stderr, "Failed to load existing database options: %s\n",
+                s.ToString().c_str());
+        fprintf(stderr, "Cannot proceed without existing options.\n");
+        return s;
+      }
+      printf("Successfully loaded existing database options\n");
     }
-
-    printf("Successfully loaded existing database options\n");
 
     // Extract column family names from loaded descriptors
     cf_names_.clear();
@@ -508,11 +529,18 @@ int main(int argc, char** argv) {
       "  # Compact all column families with default options\n"
       "  db_compact --db=/data/mydb\n"
       "\n"
+      "  # Compact using a specific OPTIONS file\n"
+      "  db_compact --db=/data/mydb --option_file=/path/to/OPTIONS-123456\n"
+      "\n"
       "  # Compact specific column families\n"
       "  db_compact --db=/data/mydb --column_families=cf1,cf2,cf3\n"
       "\n"
       "  # Compact all CFs EXCEPT cf1 and cf2 (exclusive mode)\n"
       "  db_compact --db=/data/mydb --column_families=cf1,cf2 --exclusive=true\n"
+      "\n"
+      "  # Use a specific OPTIONS file with exclusive mode\n"
+      "  db_compact --db=/data/mydb --option_file=/backup/OPTIONS-old \\\n"
+      "             --column_families=default --exclusive=true\n"
       "\n"
       "  # Use ZSTD compression with high parallelism\n"
       "  db_compact --db=/data/mydb --compression_type=zstd \\\n"
