@@ -51,7 +51,7 @@ DEFINE_int32(
     max_background_jobs, 16,
     "Maximum number of concurrent background jobs (compactions and flushes)");
 
-DEFINE_int32(max_subcompactions, 4,
+DEFINE_int32(max_subcompactions, 16,
              "Maximum number of threads for a single compaction job");
 
 DEFINE_bool(exclusive_manual_compaction, false,
