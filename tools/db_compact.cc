@@ -19,10 +19,13 @@ int main() {
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
+#include <chrono>
 
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
+#include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/options_util.h"
@@ -65,22 +68,6 @@ DEFINE_int32(
 
 DEFINE_int32(max_subcompactions, 16,
              "Maximum number of threads for a single compaction job");
-
-DEFINE_bool(exclusive_manual_compaction, false,
-            "If true, no other compaction will run at the same time");
-
-DEFINE_bool(
-    change_level, false,
-    "If true, compacted files will be moved to the minimum level capable");
-
-DEFINE_int32(
-    target_level, -1,
-    "Target level for compacted files (only used with --change_level=true)");
-
-DEFINE_string(
-    bottommost_level_compaction, "kIfHaveCompactionFilter",
-    "Bottommost level compaction strategy: kSkip, kIfHaveCompactionFilter, "
-    "kForce, kForceOptimized");
 
 DEFINE_uint64(compaction_readahead_size, 2097152,  // 2MB default
               "Compaction readahead size in bytes (0 to disable)");
@@ -135,6 +122,7 @@ class DBCompactor {
   DB* db_ = nullptr;
   std::vector<ColumnFamilyHandle*> cf_handles_;
   std::vector<std::string> cf_names_;
+  CompressionType target_compression_ = kLZ4Compression;
 
   bool ValidateFlags() {
     if (FLAGS_db.empty()) {
@@ -312,8 +300,12 @@ class DBCompactor {
               FLAGS_compression_type.c_str());
     }
 
+    target_compression_ = compression;
+
     // Override compression ONLY for user-specified column families
     for (auto& cf_desc : loaded_cf_descs) {
+      // Disable auto compactions while this tool runs
+      cf_desc.options.disable_auto_compactions = true;
       // Check if this CF is in the target list (or if we're compacting all CFs)
       if (target_cf_names.empty() ||
           std::find(target_cf_names.begin(), target_cf_names.end(),
@@ -368,39 +360,15 @@ class DBCompactor {
   }
 
   Status PerformCompaction() {
-    printf("\n=== Starting Compaction ===\n");
+    printf("\n=== Starting Same-Level Rewrite ===\n");
     printf("Configuration:\n");
-    printf("  max_background_jobs: %d\n", FLAGS_max_background_jobs);
-    printf("  max_subcompactions: %d\n", FLAGS_max_subcompactions);
-    printf("  compression_type: %s\n", FLAGS_compression_type.c_str());
+    printf("  target compression: %s\n", FLAGS_compression_type.c_str());
     printf("  block_size: %dKB\n", FLAGS_block_size);
-    printf("  exclusive_manual_compaction: %s\n",
-           FLAGS_exclusive_manual_compaction ? "true" : "false");
+    printf("  max_subcompactions (per CompactFiles): %d\n",
+           FLAGS_max_subcompactions);
     printf("  exclusive (invert CF selection): %s\n",
            FLAGS_exclusive ? "true" : "false");
     printf("\n");
-
-    // Parse bottommost level compaction
-    BottommostLevelCompaction bottommost =
-        BottommostLevelCompaction::kIfHaveCompactionFilter;
-    std::string bottommost_str = FLAGS_bottommost_level_compaction;
-    if (bottommost_str == "kSkip") {
-      bottommost = BottommostLevelCompaction::kSkip;
-    } else if (bottommost_str == "kForce") {
-      bottommost = BottommostLevelCompaction::kForce;
-    } else if (bottommost_str == "kForceOptimized") {
-      bottommost = BottommostLevelCompaction::kForceOptimized;
-    }
-
-    // Prepare compact range options
-    CompactRangeOptions compact_options;
-    compact_options.max_subcompactions =
-        static_cast<uint32_t>(FLAGS_max_subcompactions);
-    compact_options.exclusive_manual_compaction =
-        FLAGS_exclusive_manual_compaction;
-    compact_options.change_level = FLAGS_change_level;
-    compact_options.target_level = FLAGS_target_level;
-    compact_options.bottommost_level_compaction = bottommost;
 
     // Parse specified column families and compute target CFs
     std::vector<std::string> specified_cf_names;
@@ -434,7 +402,7 @@ class DBCompactor {
       target_cf_names = cf_names_;
     }
 
-    // Compact each column family
+    // Rewrite each column family
     for (size_t i = 0; i < cf_handles_.size(); ++i) {
       const std::string& cf_name = cf_names_[i];
 
@@ -450,27 +418,74 @@ class DBCompactor {
         continue;
       }
 
-      printf("Compacting column family: %s ... ", cf_name.c_str());
-      fflush(stdout);
+      printf("Rewriting column family: %s\n", cf_name.c_str());
 
       auto start = std::chrono::steady_clock::now();
-
-      Status s =
-          db_->CompactRange(compact_options, cf_handles_[i], nullptr, nullptr);
-
+      Status rewrite_status = RewriteColumnFamily(cf_handles_[i], cf_name);
       auto end = std::chrono::steady_clock::now();
       auto duration =
           std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-      if (!s.ok()) {
-        printf("FAILED (%s)\n", s.ToString().c_str());
-        return s;
+      if (!rewrite_status.ok()) {
+        printf("  FAILED (%s)\n", rewrite_status.ToString().c_str());
+        return rewrite_status;
       }
 
-      printf("OK (%.2f seconds)\n", duration.count() / 1000.0);
+      printf("  OK (%.2f seconds)\n", duration.count() / 1000.0);
     }
 
     return Status::OK();
+  }
+
+  Status RewriteColumnFamily(ColumnFamilyHandle* handle,
+                             const std::string& cf_name) {
+    ColumnFamilyMetaData meta;
+    db_->GetColumnFamilyMetaData(handle, &meta);
+
+    if (meta.levels.empty()) {
+      if (FLAGS_verbose) {
+        printf("    Column family %s has no levels to rewrite\n",
+               cf_name.c_str());
+      }
+      return Status::OK();
+    }
+
+    CompactionOptions compaction_options;
+    compaction_options.compression = target_compression_;
+    compaction_options.max_subcompactions =
+        static_cast<uint32_t>(FLAGS_max_subcompactions);
+
+    for (const auto& level : meta.levels) {
+      if (level.files.empty()) {
+        continue;
+      }
+
+      std::vector<std::string> file_names;
+      file_names.reserve(level.files.size());
+      uint64_t total_bytes = 0;
+      for (const auto& file : level.files) {
+        file_names.push_back(file.name);
+        total_bytes += file.size;
+      }
+
+      printf("    Level %d: rewriting %zu files (%.2f MB)\n", level.level,
+             file_names.size(), static_cast<double>(total_bytes) / 1048576.0);
+      Status s =
+          db_->CompactFiles(compaction_options, handle, file_names, level.level);
+      if (!s.ok()) {
+        printf("    FAILED at level %d: %s\n", level.level,
+               s.ToString().c_str());
+        return s;
+      }
+    }
+
+    return Status::OK();
+  }
+
+  Status ToggleAutoCompaction(ColumnFamilyHandle* handle, bool disable) {
+    std::unordered_map<std::string, std::string> options = {
+        {"disable_auto_compactions", disable ? "1" : "0"}};
+    return db_->SetOptions(handle, options);
   }
 
   void PrintStats(const char* label) {
@@ -501,6 +516,17 @@ class DBCompactor {
 
   void CloseDatabase() {
     if (db_) {
+      for (auto* handle : cf_handles_) {
+        if (handle) {
+          Status toggle_status = ToggleAutoCompaction(handle, false);
+          if (!toggle_status.ok()) {
+            fprintf(stderr,
+                    "Warning: failed to re-enable auto compactions during close: %s\n",
+                    toggle_status.ToString().c_str());
+          }
+        }
+      }
+
       for (auto* handle : cf_handles_) {
         if (handle) {
           db_->DestroyColumnFamilyHandle(handle);
@@ -548,9 +574,6 @@ int main(int argc, char** argv) {
       "\n"
       "  # Use custom block size (16KB)\n"
       "  db_compact --db=/data/mydb --block_size=16\n"
-      "\n"
-      "  # Exclusive manual compaction (no other compactions run)\n"
-      "  db_compact --db=/data/mydb --exclusive_manual_compaction=true\n"
       "\n"
       "  # Compact all CFs except 'default' and 'metadata' with ZSTD\n"
       "  db_compact --db=/data/mydb --column_families=default,metadata \\\n"
